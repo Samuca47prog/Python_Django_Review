@@ -13,6 +13,7 @@ Awesome — let’s do a compact but end-to-end Django refresher tailored for Wi
 - (Optional but great) WSL2 + Ubuntu for a Linux-like prod parity
 - A code editor (VS Code)
 
+### Default
 **Create project folder & venv**
 ```powershell
 mkdir django-shop && cd django-shop
@@ -27,6 +28,67 @@ pip install "django>=5.0,<6.0" psycopg2-binary python-dotenv djangorestframework
 django-admin startproject config .
 python manage.py startapp products
 ```
+
+### Option with UV
+> Install uv once (e.g., via pipx install uv or the official installer). After that, per-project:
+
+```
+# 0. Create project directory
+mkdir django-shop; cd django-shop
+
+# 1. Initialize a project with pyproject.toml + lockfile
+uv init  # creates pyproject.toml
+
+# 2. (Optional) create a dedicated .venv
+uv venv --seed  # makes .venv in the project
+
+# 3. Add dependencies (pinned in lockfile)
+uv add "django>=5,<6" psycopg2-binary python-dotenv djangorestframework
+
+# 4. Start project & app (all inside the env)
+uv run django-admin startproject config .
+uv run python manage.py startapp products
+
+# 5. Run dev server
+uv run python manage.py migrate
+uv run python manage.py runserver
+
+```
+
+Why this is nice
+* uv add updates pyproject.toml and lockfile atomically.
+* uv run ensures the command runs in the right environment without activating.
+* uv venv keeps a local .venv so editors (VS Code) auto-detect it.
+  
+### Option with Poetry
+> Install Poetry once (best via pipx install poetry). Then:
+
+```
+# 0. Create project directory
+mkdir django-shop; cd django-shop
+
+# 1. Initialize the project (non-interactive)
+poetry init -n
+
+# 2. Configure Poetry to create the venv inside the project (nice on Windows)
+poetry config virtualenvs.in-project true
+
+# 3. Add dependencies (creates poetry.lock)
+poetry add "django@^5" psycopg2-binary python-dotenv djangorestframework
+
+# 4. Spawn a shell in the venv (or use `poetry run ...`)
+poetry shell
+
+# 5. Start project & app
+django-admin startproject config .
+python manage.py startapp products
+
+# 6. Run dev server
+python manage.py migrate
+python manage.py runserver
+```
+
+
 
 **Project layout (goal)**
 ```
