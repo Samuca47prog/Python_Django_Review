@@ -540,6 +540,54 @@ Common pitfalls:
 
 
 
+### Create super user
+
+0) Pre-check (one time)
+
+Make sure migrations ran and the admin app is enabled:
+```powershell
+# If you’ve not done this since creating the project:
+poetry run python manage.py migrate
+```
+
+In config/settings.py make sure:
+```python
+INSTALLED_APPS = [
+    # ...
+    "django.contrib.admin",
+    "django.contrib.auth",
+    "django.contrib.contenttypes",
+    "django.contrib.sessions",
+    "django.contrib.messages",
+    "django.contrib.staticfiles",
+]
+```
+
+1) Interactive (fastest)
+
+Runs a prompt for username/email/password:
+```powershell
+poetry run python manage.py createsuperuser
+```
+Follow the prompts, then log in at:
+```arduino
+http://127.0.0.1:8000/admin/
+```
+
+2) Non-interactive (great for CI/Docker)
+
+Use the environment variables Django reads when --noinput is used:
+```powershell
+# PowerShell: set for this process only
+$env:DJANGO_SUPERUSER_USERNAME = "admin"
+$env:DJANGO_SUPERUSER_EMAIL    = "admin@example.com"
+$env:DJANGO_SUPERUSER_PASSWORD = "S0meLong#Password"
+
+poetry run python manage.py createsuperuser --noinput
+```
+> Notes
+> * Password must meet your validators (see  AUTH_PASSWORD_VALIDATORS in settings).
+> * In CI, set these env vars in the pipeline/secret store rather than hard-coding them.
 ---
 
 ## 1) Apps
