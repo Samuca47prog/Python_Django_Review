@@ -198,6 +198,8 @@ Common tweaks:
 
 What it is: The single source of truth for Django config. Everything else (manage.py/asgi/wsgi) just sets DJANGO_SETTINGS_MODULE and loads this.
 
+[settings docs](https://docs.djangoproject.com/en/5.2/topics/settings/)
+
 Default:
 ```python
 """
