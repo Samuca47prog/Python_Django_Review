@@ -592,21 +592,188 @@ poetry run python manage.py createsuperuser --noinput
 
 ## 1) Apps
 
-`products/apps.py` comes pre-generated. Enable signals in `products/__init__.py`:
+### What is an “app” in Django?
+* A **unit of functionality** (models, admin, views, templates, signals…).
+* Each app has an AppConfig class that Django loads and then calls ready() on after the app registry is fully populated. That’s the right place to wire signals, checks, etc.
+
+### The correct setup for Django 5.x
+
+1) `products/apps.py` (use AppConfig)
 ```python
-default_app_config = "products.apps.ProductsConfig"
+# products/apps.py
+from django.apps import AppConfig
+
+class ProductsConfig(AppConfig):
+    default_auto_field = "django.db.models.BigAutoField"  # good default for new apps
+    name = "products"           # dotted path of the app package
+    verbose_name = "Products"   # optional: nicer name in admin
+
+    def ready(self) -> None:
+        # Import modules that register side-effects (signals, system checks, etc.)
+        import products.signals  # noqa: F401
 ```
 
-And in `products/apps.py`:
+2) `config/settings.py` (reference the config class)
 ```python
-from django.apps import App, apps
+INSTALLED_APPS = [
+    # Django contrib apps...
+    "django.contrib.admin",
+    "django.contrib.auth",
+    "django.contrib.contenttypes",
+    "django.contrib.sessions",
+    "django.contrib.messages",
+    "django.contrib.staticfiles",
 
-class ProductsConfig(App):
-    name = "products"
+    # third-party...
+    # "rest_framework",
 
-    def ready(self):
-        from . import signals  # noqa: F401
+    # your apps:
+    "products.apps.ProductsConfig",   # ✅ explicit AppConfig reference
+]
 ```
+
+### Signals — how to wire them safely
+`products/signals.py`
+```python
+from django.db.models.signals import pre_save, post_migrate
+from django.dispatch import receiver
+from django.utils.text import slugify
+from .models import Product
+
+@receiver(pre_save, sender=Product, dispatch_uid="products.product_slug_auto")
+def product_slug_auto(sender, instance: Product, **kwargs):
+    if not instance.slug and instance.name:
+        instance.slug = slugify(instance.name)
+
+@receiver(post_migrate, dispatch_uid="products.seed_defaults")
+def seed_defaults(sender, app_config, **kwargs):
+    # Example: create a default product after migrations (idempotent)
+    if app_config.name != "products":
+        return
+    Product.objects.get_or_create(
+        name="Keyboard",
+        defaults={"price": 199.90, "is_active": True},
+    )
+```
+Why this pattern works:
+* Importing products.signals inside AppConfig.ready() ensures the app registry is ready (avoids circular imports/partial model states).
+* dispatch_uid makes handler registration idempotent (prevents duplicates under the dev autoreloader or multi-worker setups).
+
+### Common pitfalls & fixes
+* Using `default_app_config`: remove it (Django ≥3.2 doesn’t need it; Django 5 has dropped it).
+* Importing signals at module import time (e.g., in products/__init__.py) can cause circular-import issues. Always do it in ready().
+* Duplicate signal execution in dev: add dispatch_uid to @receiver (or use explicit signal.connect(..., dispatch_uid=...)).
+* Cross-app model references in signals: to avoid import cycles, resolve lazily:
+```python
+  from django.apps import apps
+  Order = apps.get_model("orders", "Order")  # app_label, ModelName
+```
+* Doing heavy work in ready() (DB/network): avoid—use post_migrate, a startup management command, or a background task.
+
+
+### How to create a page
+Easy. Here are two clean ways—pick one:
+* A) Truly static page (no DB query) using TemplateView
+* B) Dynamic page (list products) using a small view
+
+I’ll also show the minimal HTML and CSS and where to put each file.
+
+#### A) Static “About Products” page (TemplateView)
+
+0) Project router delegates correctly?
+Open `config/urls.py` and make sure it includes your app routes at the root:
+```python
+# config/urls.py
+from django.contrib import admin
+from django.urls import path, include
+
+urlpatterns = [
+    path("admin/", admin.site.urls),
+
+    # ⬇️ this puts products' routes at the site root, so /about/ works
+    path("products/", include(("products.urls", "products"), namespace="products")),
+]
+```
+
+
+1) Route
+`products/urls.py`
+```python
+from django.urls import path
+from django.views.generic import TemplateView
+
+app_name = "products"
+
+urlpatterns = [
+    # ... your existing routes
+    path("about/", TemplateView.as_view(template_name="products/about.html"), name="about"),
+]
+```
+
+2) Template
+`templates/products/about.html`
+```html
+{% load static %}
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>About Products</title>
+  <link rel="stylesheet" href="{% static 'css/products.css' %}">
+</head>
+<body>
+  <header><h1>About Our Products</h1></header>
+  <main class="container">
+    <p>This is a simple static page with a tiny CSS file.</p>
+    <ul class="bullets">
+      <li>Quality items</li>
+      <li>Fair pricing</li>
+      <li>Fast delivery</li>
+    </ul>
+  </main>
+</body>
+</html>
+```
+
+3) CSS
+`static/css/products.css`
+```css
+html, body { margin: 0; padding: 0; font-family: system-ui, Arial, sans-serif; }
+header { padding: 16px; border-bottom: 1px solid #ddd; }
+.container { max-width: 720px; margin: 24px auto; padding: 0 16px; line-height: 1.6; }
+.bullets { margin: 12px 0; }
+```
+
+ready to open `http://127.0.0.1:8000/products/about/`
+
+
+#### B) Dynamic “About Products” page (list products)
+
+1) View
+`products/views.py`
+```python
+from django.shortcuts import render
+
+def about_products(request):
+    products = []
+    return render(request, "products/about.html", {"products": products})
+```
+
+2) Route
+`products/urls.py`
+```python
+from django.urls import path
+from . import views
+
+app_name = "products"
+
+urlpatterns = [
+    # ... your existing routes
+    path("about/", views.about_products, name="about"),
+]
+```
+
+
 
 ---
 
