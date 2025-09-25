@@ -678,7 +678,6 @@ Easy. Here are two clean ways—pick one:
 
 I’ll also show the minimal HTML and CSS and where to put each file.
 
-#### A) Static “About Products” page (TemplateView)
 
 0) Project router delegates correctly?
 Open `config/urls.py` and make sure it includes your app routes at the root:
@@ -695,6 +694,7 @@ urlpatterns = [
 ]
 ```
 
+#### A) Static “About Products” page (TemplateView)
 
 1) Route
 `products/urls.py`
@@ -773,6 +773,223 @@ urlpatterns = [
 ]
 ```
 
+### Recommended layering inside an app
+```graphql
+products/
+  __init__.py
+  apps.py
+  models.py
+  managers.py          # custom QuerySet/Manager (optional but great)
+  selectors.py         # READ-ONLY query helpers (no side-effects)
+  services.py          # WRITE/side-effect operations (create/update/delete)
+  validators.py        # app-specific validation (if needed)
+  forms.py             # HTML forms (server-side validation/UI)
+  serializers.py       # DRF serializers (API validation)
+  views.py             # calls selectors/services + handles HTTP
+  urls.py
+  signals.py
+  tests/
+```
+* selectors.py: “Which data to read?” Pre-optimized queries, NO writes. Safe to cache.
+* services.py: “What change to make?” Transactional business operations.
+* managers.py: Custom QuerySet/Manager methods to encapsulate common filters.
+* views.py: Glue only—parse input → call selector/service → render/redirect/JSON.
+This separation makes unit testing trivial and prevents fat views.
+
+#### 1) Model + Manager/QuerySet (optional but powerful)
+`models.py`
+```python
+from django.db import models
+
+class ProductQuerySet(models.QuerySet):
+    def active(self):
+        return self.filter(is_active=True)
+
+class Product(models.Model):
+    name = models.CharField(max_length=120, unique=True)
+    slug = models.SlugField(max_length=140, unique=True, blank=True)
+    description = models.TextField(blank=True)
+    price = models.DecimalField(max_digits=10, decimal_places=2, default=0)
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    objects = ProductQuerySet.as_manager()
+
+    class Meta:
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        return self.name
+```
+> Now you can do `Product.objects.active()` anywhere (selectors/services/views/tests).
+
+#### 2) selectors.py (read-only logic)
+```python
+# products/selectors.py
+from django.db.models import QuerySet
+from .models import Product
+
+def list_products(q: str | None = None, active_only: bool = True) -> QuerySet[Product]:
+    qs = Product.objects.all()
+    if active_only:
+        qs = qs.active()
+    if q:
+        qs = qs.filter(name__icontains=q)
+    return qs.select_related()  # add select_related/prefetch_related as needed
+
+def get_product_by_slug(slug: str) -> Product:
+    return Product.objects.get(slug=slug)
+```
+> Rules of thumb: **no writes**, no transactions here. Just consistent, optimized queries.
+
+#### 3) services.py (write/side-effect logic)
+```python
+# products/services.py
+from django.db import transaction
+from django.db.models import F
+from django.utils.text import slugify
+from .models import Product
+
+@transaction.atomic
+def create_product(*, name: str, description: str = "", price: float = 0.0, is_active: bool = True) -> Product:
+    slug = slugify(name)
+    obj = Product.objects.create(
+        name=name, slug=slug, description=description, price=price, is_active=is_active
+    )
+    return obj
+
+@transaction.atomic
+def update_product_price(*, product_id: int, new_price: float) -> Product:
+    # safe concurrent update
+    Product.objects.filter(pk=product_id).update(price=new_price)
+    return Product.objects.get(pk=product_id)
+
+@transaction.atomic
+def deactivate_product(*, slug: str) -> None:
+    p = Product.objects.select_for_update().get(slug=slug)
+    p.is_active = False
+    p.save(update_fields=["is_active"])
+```
+> Put business invariants here (e.g., “price cannot be negative”) and raise domain errors. Views should not duplicate this logic.
+
+#### 4) Use them in views
+
+##### A) Function-Based Views (FBV)
+```python
+# products/views.py
+from django.shortcuts import render, redirect, get_object_or_404
+from . import selectors, services
+from .forms import ProductForm
+
+def product_list(request):
+    q = request.GET.get("q")
+    products = selectors.list_products(q=q)
+    return render(request, "products/product_list.html", {"products": products})
+
+def product_create(request):
+    if request.method == "POST":
+        form = ProductForm(request.POST)
+        if form.is_valid():
+            services.create_product(**form.cleaned_data)
+            return redirect("products:list")
+    else:
+        form = ProductForm()
+    return render(request, "products/product_form.html", {"form": form})
+
+def product_deactivate(request, slug):
+    # permission checks here if needed
+    services.deactivate_product(slug=slug)
+    return redirect("products:list")
+```
+
+##### B) Class-Based Views (CBV)
+```python
+# products/views.py
+from django.views.generic import ListView, CreateView
+from django.urls import reverse_lazy
+from . import selectors, services
+from .forms import ProductForm
+
+class ProductListView(ListView):
+    template_name = "products/product_list.html"
+    paginate_by = 10
+
+    def get_queryset(self):
+        q = self.request.GET.get("q")
+        return selectors.list_products(q=q)
+
+class ProductCreateView(CreateView):
+    form_class = ProductForm
+    template_name = "products/product_form.html"
+    success_url = reverse_lazy("products:list")
+
+    def form_valid(self, form):
+        services.create_product(**form.cleaned_data)
+        return super().form_valid(form)  # or redirect yourself
+```
+> For **UpdateView/DeleteView**, override form_valid()/delete() and call your service.
+
+#### 5) Validation: where?
+
+* HTML views: use `forms.py` (ModelForm/Form) as the primary validation + UI binding.
+* APIs (DRF): use serializers for validation; call services in `Serializer.create/update` or in `ViewSet.perform_create/perform_update`.
+* Services assume validated inputs (DTO pattern). They enforce business rules, not raw parsing.
+
+Example DRF create using services:
+```python
+# products/serializers.py
+from rest_framework import serializers
+from .models import Product
+from . import services
+
+class ProductSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Product
+        fields = ["id", "name", "slug", "description", "price", "is_active", "created_at", "updated_at"]
+        read_only_fields = ["id", "slug", "created_at", "updated_at"]
+
+    def create(self, validated_data):
+        return services.create_product(**validated_data)
+```
+
+#### 6) Where to put tiny helpers?
+
+* Pure helpers (formatting, math): utils.py (no Django imports).
+* Cross-app stuff: a “core” app with core/services.py, core/selectors.py.
+* Long-running / async work: tasks.py and Celery (services enqueue tasks, tasks call services).
+
+#### 7) Concurrency & transactions (must-know)
+
+* Wrap multi-write operations with @transaction.atomic.
+* Use select_for_update() to lock rows when enforcing invariants.
+* Use F expressions for atomic increments/decrements.
+* Keep transactions short; do not call external services inside them.
+
+#### 8) Testing strategy
+
+Unit test services/selectors directly (fast, no HTTP client needed).
+
+View tests should be thin: focus on routing/permissions/template context.
+
+Example:
+```python
+# products/tests/test_services.py
+import pytest
+from products import services
+
+@pytest.mark.django_db
+def test_create_product_sets_slug():
+    p = services.create_product(name="My Keyboard", price=100)
+    assert p.slug.startswith("my-keyboard")
+```
+
+#### TL;DR
+
+* Put reads in selectors.py, writes in services.py, and keep views thin.
+* Use QuerySet/Manager methods for reusable filters.
+* Validate via forms (HTML) or serializers (API), and enforce domain rules in services.
+* Call your functions from FBVs/CBVs/DRF views with a few lines of glue.
 
 
 ---
@@ -785,7 +1002,7 @@ from django.db import models
 from django.utils.text import slugify
 
 class Product(models.Model):
-    name = models.CharField(maxlength=120, unique=True)
+    name = models.CharField(max_length=120, unique=True)
     slug = models.SlugField(max_length=140, unique=True, blank=True)
     description = models.TextField(blank=True)
     price = models.DecimalField(max_digits=10, decimal_places=2, default=0)
@@ -799,12 +1016,505 @@ class Product(models.Model):
     def __str__(self):
         return self.name
 ```
-> **Note:** If `maxlength` raises an error, use `max_length` (the correct Django argument).
 
-```powershell
-python manage.py makemigrations
-python manage.py migrate
+Optimized models.py
+```python
+# products/models.py
+from __future__ import annotations
+from decimal import Decimal
+from django.db import models
+from django.utils import timezone
+from django.utils.text import slugify
+from django.core.validators import MinValueValidator
+from django.db.models import Q, F
+from django.urls import reverse
+
+class Product(models.Model):
+    name = models.CharField(max_length=120, unique=True) 
+    slug = models.SlugField(max_length=140, unique=True, blank=True)
+    description = models.TextField(blank=True)
+    price = models.DecimalField(
+        max_digits=10, decimal_places=2, default=Decimal("0.00"),
+        validators=[MinValueValidator(Decimal("0.00"))]
+    )
+    is_active = models.BooleanField(default=True)
+    published_at = models.DateTimeField(null=True, blank=True, default=None)
+    created_at = models.DateTimeField(auto_now_add=True)  # set on INSERT
+    updated_at = models.DateTimeField(auto_now=True)      # set on UPDATE
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["slug"], name="product_slug_idx"),
+            models.Index(fields=["-created_at"], name="product_created_idx"),
+        ]
+        constraints = [
+            # Example: ensure non-negative price (also enforced by validator)
+            models.CheckConstraint(check=Q(price__gte=0), name="product_price_gte_0"),
+        ]
+
+    def __str__(self) -> str:
+        return self.name
+
+    # Optional: auto-slug if blank (you can also do this in a pre_save signal)
+    def save(self, *args, **kwargs):
+        if not self.slug and self.name:
+            base = slugify(self.name)
+            slug = base
+            i = 2
+            while Product.objects.filter(slug=slug).exclude(pk=self.pk).exists():
+                slug = f"{base}-{i}"
+                i += 1
+            self.slug = slug
+        return super().save(*args, **kwargs)
+
+    # URLs for convenience in templates/views
+    def get_absolute_url(self) -> str:
+        return reverse("products:detail", kwargs={"slug": self.slug})
+
+    def publish(self):
+        """Example domain method."""
+        if self.published_at is None:
+            self.published_at = timezone.now()
+            self.save(update_fields=["published_at", "updated_at"])
 ```
+### A. Registering a model in Admin
+for the model to appear in Admin section, it must be added to the admin file
+
+`products/admin.py`
+```python
+from .models import Product
+
+admin.site.register(Product)
+```
+
+### B. Relationships
+
+#### 1) One-to-Many: Category → Product
+* Each product belongs to a category; categories list their products.
+* Use PROTECT to prevent deleting a category that still has products.
+
+```python
+class Category(models.Model):
+    name = models.CharField(max_length=80, unique=True)
+    slug = models.SlugField(max_length=100, unique=True)
+
+    class Meta:
+        ordering = ["name"]
+
+    def __str__(self):
+        return self.name
+
+class Product(models.Model):
+    # ... previous fields ...
+    category = models.ForeignKey(
+        Category,
+        on_delete=models.PROTECT,
+        related_name="products",
+        null=True, blank=True,
+    )
+    # rest of Product as above
+```
+
+usage
+```python
+# create
+c = Category.objects.create(name="Keyboards", slug="keyboards")
+p = Product.objects.create(name="MX Board", price=Decimal("299.00"), category=c)
+
+# reverse relation
+c.products.all()      # QuerySet[Product]
+p.category.name
+```
+
+#### 2) One-to-One: Product ↔ Detail
+* Split rarely-needed columns into a different table.
+```python
+class ProductDetail(models.Model):
+    product = models.OneToOneField(
+        Product, on_delete=models.CASCADE, related_name="detail"
+    )
+    specs_json = models.JSONField(default=dict, blank=True)
+
+```
+
+usage
+```python
+p.detail.specs_json  # raises ProductDetail.DoesNotExist if not created yet
+```
+
+#### 3) Many-to-Many: Product ↔ Tag (with and without “through”)
+* Simple M2M:
+```python
+class Tag(models.Model):
+    name = models.CharField(max_length=40, unique=True)
+    def __str__(self): return self.name
+
+class Product(models.Model):
+    # ...
+    tags = models.ManyToManyField(Tag, related_name="products", blank=True)
+```
+
+usage
+```python
+t = Tag.objects.create(name="mechanical")
+p.tags.add(t)
+p.tags.all()          # tags for a product
+t.products.all()      # products for a tag
+```
+
+* M2M with extra fields (custom “through” model):
+```python
+class ProductTag(models.Model):
+    product = models.ForeignKey(Product, on_delete=models.CASCADE)
+    tag = models.ForeignKey(Tag, on_delete=models.CASCADE)
+    weight = models.PositiveIntegerField(default=1)
+    class Meta:
+        unique_together = [("product", "tag")]
+
+class Product(models.Model):
+    # ...
+    tags = models.ManyToManyField(Tag, through="ProductTag", related_name="products")
+```
+
+#### 4) One-to-Many: Product → ProductImage
+* Store multiple images per product.
+```python
+# pip install Pillow
+class ProductImage(models.Model):
+    product = models.ForeignKey(Product, on_delete=models.CASCADE, related_name="images")
+    image = models.ImageField(upload_to="products/%Y/%m/")  # MEDIA_ROOT required
+    alt = models.CharField(max_length=120, blank=True)
+    position = models.PositiveIntegerField(default=0)
+
+    class Meta:
+        ordering = ["position", "id"]
+        indexes = [models.Index(fields=["product", "position"])]
+```
+
+### C. Useful model methods & patterns
+
+#### 1) Choices with enums (nice admin + get_FOO_display())
+```python
+class ProductStatus(models.TextChoices):
+    DRAFT = "draft", "Draft"
+    PUBLISHED = "published", "Published"
+    ARCHIVED = "archived", "Archived"
+
+class Product(models.Model):
+    # ...
+    status = models.CharField(
+        max_length=16, choices=ProductStatus.choices, default=ProductStatus.DRAFT
+    )
+
+# Usage
+p.get_status_display()        # "Draft", "Published", ...
+```
+
+
+#### 2) Validation hooks: clean() and full_clean()
+```python
+from django.core.exceptions import ValidationError
+
+class Product(models.Model):
+    # ...
+    def clean(self):
+        super().clean()
+        if self.price and self.price > Decimal("100000.00"):
+            raise ValidationError({"price": "Price too large for this catalog."})
+```
+> Django forms/ModelForms call `full_clean()`. If you create models directly, call obj.full_clean() before save() when you want model-level validation enforced.
+
+#### 3) update_fields to speed up writes
+```python
+p.name = "New name"
+p.save(update_fields=["name", "updated_at"])
+```
+
+#### 4) refresh_from_db to re-load after concurrent updates
+```python
+p.refresh_from_db(fields=["price"])
+```
+
+#### 5) Soft-delete pattern (conditional uniqueness)
+If you soft-delete or mark inactive, you often want unique constraints only for active rows:
+```python
+class Meta:
+    constraints = [
+        models.UniqueConstraint(
+            fields=["slug"],
+            condition=Q(is_active=True),
+            name="uniq_active_slug"
+        )
+    ]
+```
+
+### D. Managers & QuerySets (useful functions you’ll call from views/services)
+Put read filters in a custom QuerySet and expose via manager:
+```python
+class ProductQuerySet(models.QuerySet):
+    def active(self):
+        return self.filter(is_active=True)
+
+    def search(self, q: str | None):
+        return self if not q else self.filter(name__icontains=q)
+
+    def published(self):
+        return self.filter(status="published")
+
+class Product(models.Model):
+    # ...
+    objects = ProductQuerySet.as_manager()
+```
+
+usage
+```python
+Product.objects.active().search("keyboard").order_by("price")
+Product.objects.select_related("category").prefetch_related("tags")
+```
+
+> Tips:
+> * select_related() for FK/OneToOne (joins, single query).
+> * prefetch_related() for M2M/Reverse FK (two queries + in-Python join).
+> * only()/defer() to trim columns when listing.
+
+
+### E. Constraints, indexes, performance
+* UniqueConstraint with Lower() (case-insensitive uniqueness, PostgreSQL):
+```python
+from django.db.models.functions import Lower
+models.UniqueConstraint(Lower("name"), name="uniq_product_name_ci")
+```
+* CheckConstraint for domain rules (price ≥ 0 shown above).
+* GIN/JSON indexes (Postgres) for JSONField searches if you store specs.
+* Always index fields used in filters/joins/sorting often (slug, FK, created_at).
+
+### F. Common ORM operations you’ll use
+```python
+from django.db import transaction
+from django.db.models import Count, Sum, Avg, F, Q
+
+# get_or_create / update_or_create
+p, created = Product.objects.get_or_create(name="Keyboard", defaults={"price": 199.90})
+obj, _ = Product.objects.update_or_create(slug="mx-board", defaults={"price": 249.00})
+
+# annotate / aggregate
+Product.objects.active().annotate(tag_count=Count("tags")).order_by("-tag_count")
+Product.objects.aggregate(avg_price=Avg("price"))
+
+# transactions
+with transaction.atomic():
+    Product.objects.filter(pk=p.pk).update(price=F("price") - 10)
+
+# bulk ops
+Product.objects.bulk_create([
+    Product(name="Mouse", price=Decimal("99.90")),
+    Product(name="Monitor", price=Decimal("999.00")),
+])
+```
+
+### G. Files/media note
+If you use ImageField/FileField, configure:
+```python
+# settings.py
+MEDIA_URL = "/media/"
+MEDIA_ROOT = BASE_DIR / "media"
+```
+
+Serve via Django only in dev:
+
+```python
+# config/urls.py
+from django.conf import settings
+from django.conf.urls.static import static
+urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
+```
+In prod, serve media via your web server or object storage (S3, etc.).
+
+### TL;DR
+
+* Model relationships: FK (Category), O2O (Detail), M2M (Tag), reverse managers.
+* Add indexes; use select_related/prefetch_related.
+* Keep business logic in model methods/managers (plus your services.py layer).
+* Use constraints (Check/Unique with conditions) to move invariants to the DB.
+
+
+### Migrations
+
+#### What a migration is
+* **Schema migration**: describes changes to tables/indexes/constraints (add/rename fields, create models, add indexes…).
+* **Data migration**: Python code that transforms data (backfills a new column, moves data between fields, etc.).
+* Each migration is a Python file in app_name/migrations/, named like 0003_add_status.py, and forms a graph with dependencies.
+
+Typical workflow:
+```powershell
+# after editing models.py
+poetry run python manage.py makemigrations products
+poetry run python manage.py migrate              # applies to DB
+poetry run python manage.py showmigrations       # see status
+poetry run python manage.py sqlmigrate products 0003  # preview SQL
+```
+> Use --name to label a migration:
+> `poetry run python manage.py makemigrations products --name add_status_to_product`
+
+#### Reading a migration file
+A minimal “create model” migration looks like:
+```python
+# products/migrations/0001_initial.py
+from django.db import migrations, models
+
+class Migration(migrations.Migration):
+    initial = True
+    dependencies = []  # runs first for this app
+    operations = [
+        migrations.CreateModel(
+            name="Product",
+            fields=[
+                ("id", models.BigAutoField(primary_key=True, serialize=False)),
+                ("name", models.CharField(max_length=120, unique=True)),
+                ("slug", models.SlugField(max_length=140, unique=True, blank=True)),
+                ("price", models.DecimalField(max_digits=10, decimal_places=2, default=0)),
+                ("is_active", models.BooleanField(default=True)),
+                ("created_at", models.DateTimeField(auto_now_add=True)),
+                ("updated_at", models.DateTimeField(auto_now=True)),
+            ],
+            options={"ordering": ["-created_at"]},
+        ),
+    ]
+```
+* dependencies controls ordering across apps.
+* operations is an ordered list of atomic steps (create/alter/rename/constraints/indexes).
+
+#### Common schema operations (copy/paste)
+
+##### Add a new nullable column (safe default)
+```python
+migrations.AddField(
+    model_name="product",
+    name="status",
+    field=models.CharField(max_length=16, null=True, blank=True),
+)
+```
+
+##### Make it NOT NULL after backfilling (two-step)
+```python
+migrations.AlterField(
+    model_name="product",
+    name="status",
+    field=models.CharField(max_length=16, null=False, default="draft"),
+)
+```
+
+##### Rename a field (preserves data)
+```python
+migrations.RenameField("product", "old_name", "name")
+```
+
+##### Add/Remove unique constraint or index
+```python
+from django.db.models import Q, Index
+migrations.AddConstraint(
+    model_name="product",
+    constraint=models.UniqueConstraint(
+        fields=["slug"], condition=Q(is_active=True), name="uniq_active_slug"
+    ),
+)
+migrations.AddIndex(
+    model_name="product",
+    index=Index(fields=["-created_at"], name="product_created_idx"),
+)
+```
+
+##### Add a ForeignKey / ManyToMany
+```python
+migrations.AddField(
+    model_name="product",
+    name="category",
+    field=models.ForeignKey(
+        to="products.category", on_delete=models.PROTECT, null=True, blank=True, related_name="products"
+    ),
+)
+```
+
+#### Data migrations (RunPython): backfill safely
+Use historical models via apps.get_model() (not direct imports), so the migration works even after models change later.
+
+```python
+# products/migrations/0005_backfill_status.py
+from django.db import migrations
+
+def forward(apps, schema_editor):
+    Product = apps.get_model("products", "Product")
+    # bulk update without loading all rows into memory
+    Product.objects.filter(status__isnull=True).update(status="draft")
+
+def backward(apps, schema_editor):
+    Product = apps.get_model("products", "Product")
+    Product.objects.filter(status="draft").update(status=None)
+
+class Migration(migrations.Migration):
+    dependencies = [("products", "0004_add_status")]
+    operations = [migrations.RunPython(forward, backward)]
+```
+> Important: Put data migrations in a separate migration right after the schema change. Keep functions idempotent where possible.
+
+#### Zero-downtime pattern for “NOT NULL + default” on big tables (prod)
+1. Add nullable column (no default at DB-level):
+```python
+migrations.AddField(... null=True, blank=True)
+```
+2. Deploy this; app writes new rows with value, old rows remain NULL.
+3. Backfill with a RunPython migration in batches (if very large, do it offline/management command).
+4. Enforce NOT NULL and add default (application-level default is fine, DB-level default optional):
+```python
+migrations.AlterField(... null=False, default="draft")
+```
+This avoids table locks and long transactions on Postgres.
+
+#### Ordering & dependencies across apps
+If a `ForeignKey` points to another app’s model, Django auto-adds a dependency, e.g.:
+```python
+dependencies = [
+    ("catalog", "0010_auto"),
+]
+```
+You can add your own if a data migration must run after another app’s migration.
+
+#### Merge conflicts & branches
+When two branches create migrations from the same base, you’ll get a migration conflict. Fix it by creating a merge migration:
+```powershell
+poetry run python manage.py makemigrations --merge
+```
+This generates, e.g., 0012_merge_0011_A_0011_B.py that depends on both heads. Inspect and run migrate.
+
+#### Reversibility & testing
+* Make data migrations reversible (supply backward) when practical. If not, pass migrations.RunPython.noop as the reverse callable.
+* Dry run / inspect:
+```powershell
+poetry run python manage.py makemigrations --check   # fail CI if migrations needed
+poetry run python manage.py showmigrations
+poetry run python manage.py migrate --plan           # see planned operations
+poetry run python manage.py sqlmigrate products 0005 # preview SQL
+```
+
+#### Squashing old migrations
+When an app has many migrations, you can squash:
+```powershell
+poetry run python manage.py squashmigrations products 0001 0050
+```
+* Produces a single squashed migration. Review carefully, especially data ops.
+* Apply squashed migration on new environments; existing DBs with older chain will be recognized as up-to-date.
+
+#### Renames vs drop/create
+* Prefer RenameField / RenameModel over removing + adding; you keep data and references.
+* If you must split/merge columns, write a schema change + RunPython data migration to move data.
+
+#### When to put logic in migrations vs code
+* **Schema definition** (columns, constraints, indexes) → migrations.
+* **One-time data changes** to support a schema change → data migration (RunPython).
+* **Large/long-running backfills** → custom management command scheduled separately (migrations should be quick and safe to run at deploy time).
+
+
 
 ---
 
@@ -821,6 +1531,7 @@ Product.objects.filter(is_active=True).order_by("price")
 Product.objects.filter(name__icontains="key")
 Product.objects.only("id", "name").values("id", "name")
 Product.objects.select_for_update()           # in transactions
+
 from django.db import transaction
 with transaction.atomic():
     Product.objects.filter(pk=p.pk).update(price=179.90)
@@ -1177,6 +1888,8 @@ pip install psycopg2-binary
 ```
 
 ---
+
+#TODO talk about Serializers
 
 ## 14) Django REST Framework (DRF)
 
