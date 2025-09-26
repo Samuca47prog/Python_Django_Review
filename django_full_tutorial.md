@@ -1539,6 +1539,348 @@ with transaction.atomic():
 
 Performance tips: use `select_related` (FK), `prefetch_related` (M2M), and avoid N+1 queries in list views.
 
+
+### Open an interactive shell
+```powershell
+poetry run python manage.py shell
+```
+**execute:**
+```python
+from decimal import Decimal
+from django.db import transaction
+from django.db.models import Q, F, Count, Sum, Avg, Min, Max, Value, Case, When
+from django.db.models.functions import Lower, Coalesce, Concat
+from products.models import Product, Category, Tag, ProductTag, ProductStatus
+```
+
+#### 1) Create / Read / Update / Delete (CRUD)
+
+**Create**
+```python
+c = Category.objects.create(name="Keyboards", slug="keyboards")
+p = Product.objects.create(name="Keyboard", price=Decimal("199.90"), category=c)
+Tag.objects.bulk_create([Tag(name="mechanical", slug="mechanical"),
+                         Tag(name="wireless", slug="wireless")])
+```
+
+**Read (filtering & ordering)**
+```python
+Product.objects.filter(is_active=True).order_by("price", "-created_at")
+Product.objects.filter(name__icontains="key")                       # LIKE %key%
+Product.objects.filter(price__gte=100, price__lt=250)               # range
+Product.objects.filter(Q(name__icontains="key") | Q(description__icontains="key"))
+Product.objects.exclude(is_active=True)
+Product.objects.order_by().values("id", "name")                     # no default ordering
+Product.objects.values_list("slug", flat=True)
+Product.objects.in_bulk([1, 2, 3])                                  # {id: Product}
+Product.objects.first(), Product.objects.last(), Product.objects.get(pk=1)
+```
+
+**Update**
+```python
+# single instance
+p.price = Decimal("179.90")
+p.save(update_fields=["price", "updated_at"])
+
+# bulk update (no save() signals)
+Product.objects.filter(pk=p.pk).update(price=F("price") - 10)
+
+# update_or_create (atomic upsert-style)
+obj, created = Product.objects.update_or_create(
+    slug="keyboard", defaults={"price": Decimal("189.90")}
+)
+```
+
+**Delete**
+```python
+Product.objects.filter(price__lt=Decimal("50")).delete()
+```
+
+#### 2) Relations (FK / M2M / reverse)
+```python
+# FK forward & reverse
+p.category            # Category instance or None
+c.products.all()      # reverse FK manager
+
+# M2M (explicit through model present)
+t = Tag.objects.get(slug="mechanical")
+p.tags.add(t)         # works even with through; Django creates ProductTag row
+p.tags.all()
+t.products.all()
+
+# Through model with extra fields
+ProductTag.objects.create(product=p, tag=t, weight=3)
+ProductTag.objects.filter(tag__slug="mechanical").select_related("product", "tag")
+```
+
+**Performance: join vs prefetch**
+```python
+# FK / OneToOne: join with select_related
+Product.objects.select_related("category").all()
+
+# M2M / Reverse FK: prefetch (two queries, then in-Python join)
+Product.objects.prefetch_related("tags")           # all tags
+from django.db.models import Prefetch
+Product.objects.prefetch_related(
+    Prefetch("tags", queryset=Tag.objects.order_by("name"))
+)
+```
+
+#### 3) Aggregations & annotations
+```python
+# Aggregations (scalar result)
+Product.objects.aggregate(
+    avg_price=Avg("price"), max_price=Max("price"), n=Count("id")
+)
+
+# Annotate per-row values (adds fields to each instance)
+qs = (Product.objects
+      .active()
+      .annotate(tag_count=Count("tags", distinct=True))
+      .annotate(name_ci=Lower("name")))
+for row in qs.values("name", "tag_count", "name_ci"):
+    print(row)
+
+# Conditional annotation (CASE WHEN)
+Product.objects.annotate(
+    pricey=Case(When(price__gte=300, then=Value(True)), default=Value(False))
+)
+
+# String concatenation
+Product.objects.annotate(full=Concat("name", Value(" - "), "slug"))
+```
+Subqueries / correlated subqueries (advanced)
+```python
+from django.db.models import OuterRef, Subquery
+
+# Example: tag count via subquery
+pt = ProductTag.objects.filter(product=OuterRef("pk")).values("product").annotate(n=Count("*")).values("n")
+Product.objects.annotate(tag_n=Coalesce(Subquery(pt), 0)).order_by("-tag_n")
+```
+
+##### Aggregations & Annotations
+What they are
+* **Aggregation**: collapse a queryset to one (or a few) scalar values (e.g., count, average). Returns a dict, not model instances.
+* **Annotation**: add computed columns to each row in a queryset (e.g., tag_count, discounted_price) so you can filter/order by them without leaving SQL.
+
+Why use them
+* Push computation to the DB (fast, reduces Python loops).
+* Avoid N+1: compute counts/sums with COUNT/SUM instead of per-row queries.
+* Filter/order by computed values in one round trip.
+* Summarize data (dashboards, analytics) or decorate rows (badges, flags).
+
+When to use which
+* Use Aggregation when you need a single number/tuple per group: totals, averages, min/max, etc.
+* Use Annotation when you still want rows back but with extra fields you can filter/sort on.
+
+
+
+#### 4) Transactions & row locking
+Atomic blocks
+```python
+from django.db import transaction
+
+with transaction.atomic():
+    p = Product.objects.select_for_update().get(pk=1)  # lock row
+    p.price = F("price") + 5
+    p.save(update_fields=["price"])
+```
+select_for_update options (Postgres/MySQL):
+```python
+# nowait: raise immediately if row is locked; skip_locked: skip locked rows
+Product.objects.select_for_update(nowait=True).get(pk=1)
+Product.objects.select_for_update(skip_locked=True).filter(status=ProductStatus.PUBLISHED)
+```
+> Keep transactions short; avoid network calls inside. Use F() expressions for atomic math on the DB side.
+
+##### Transactions & Row Locking
+What they are
+* **Transaction**: a unit of work that’s all-or-nothing. In Django: transaction.atomic() ensures commit or rollback as one block.
+* **Row locking**: prevent concurrent writers from trampling each other by acquiring locks on selected rows (usually via SELECT … FOR UPDATE).
+
+Why use them
+* Correctness under concurrency (avoid race conditions like double-spend, negative stock/price).
+* Invariants stay true even with many workers/requests.
+* Predictable error handling (commit/rollback boundaries).
+
+When to use them
+* Read-modify-write sequences that must be consistent (e.g., adjust price/stock).
+* Idempotent jobs split across multiple writes.
+* “Queue worker” patterns where many workers pull from the same table.
+
+
+
+#### 5) Bulk ops & pagination
+```python
+# Bulk create/update (no signals; partial validation)
+ps = [Product(name=f"Prod {i}", price=Decimal("9.99")) for i in range(1000)]
+Product.objects.bulk_create(ps, batch_size=500)
+
+# bulk_update (update selected fields on many objects you already loaded)
+for p in ps: p.price = Decimal("12.99")
+Product.objects.bulk_update(ps, fields=["price"], batch_size=500)
+
+# Pagination (don’t slice deep without ordering)
+page = 3; per = 20
+qs = Product.objects.order_by("id")[ (page-1)*per : page*per ]
+```
+
+Memory-friendly iteration
+```python
+for p in Product.objects.iterator(chunk_size=2000):
+    ...
+```
+
+#### 6) Field lookups & transforms (cheat sheet)
+* Text: icontains, istartswith, iendswith, regex, iregex, exact, iexact
+* Comparisons: lt, lte, gt, gte, range, in, isnull
+* Date/time: date, year, month, day, week_day
+* Array/JSON (Postgres): contains, contained_by, has_key, has_keys, has_any_keys
+* DB functions: Lower, Upper, Length, Trim, Coalesce, Greatest, Least, Now, Extract…
+* Distinct: distinct() and Postgres distinct-on: distinct("category") with matching .order_by("category", ...)
+
+#### 7) .values() / .values_list() vs model instances
+* values() / values_list() → returns dicts/tuples, faster to serialize, no model methods.
+* Model instances → richer but heavier. Use .only() or .defer() to trim columns:
+```python
+Product.objects.only("id", "name")               # loads only these fields
+Product.objects.defer("description", "updated_at")
+```
+
+#### 8) Query evaluation & caching
+* QuerySets are lazy. They evaluate on iteration or when you call list(), len(), bool(), exists(), etc.
+* A QuerySet caches results after first evaluation:
+```python
+qs = Product.objects.active()
+list(qs)        # hits DB
+list(qs)        # cached
+qs = qs.all()   # same cache; however, changing the queryset (e.g., .filter()) invalidates cache
+```
+Use exists() when you only care if any row matches:
+```python
+if Product.objects.filter(slug="x").exists():
+    ...
+```
+
+#### 9) Debugging queries & profiling
+Print SQL of a queryset
+```python
+print(Product.objects.filter(is_active=True).query)
+```
+
+Explain (ask the DB for the plan)
+```python
+Product.objects.filter(is_active=True).explain()             # backend default
+Product.objects.filter(is_active=True).explain(analyze=True) # Postgres: run+plan (careful in prod)
+```
+
+Log queries in dev (settings.py)
+```python
+LOGGING = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "handlers": {"console": {"class": "logging.StreamHandler"}},
+    "loggers": {
+        "django.db.backends": {"handlers": ["console"], "level": "DEBUG"},
+    },
+}
+```
+Or use django-debug-toolbar for in-browser query inspection.
+
+#### 10) Common patterns (that save your bacon)
+Idempotent create (don’t duplicate rows)
+```python
+obj, created = Product.objects.get_or_create(
+    name="Keyboard",
+    defaults={"price": Decimal("199.90")},
+)
+```
+
+Conditional uniqueness (already modeled), reuse slug after “archive”
+```python
+# thanks to UniqueConstraint(condition=Q(is_active=True))
+Product.objects.create(name="MX Board", is_active=False)
+Product.objects.create(name="MX Board", is_active=True)  # allowed
+```
+
+Rank/Window functions (Postgres)
+```python
+from django.db.models import Window
+from django.db.models.functions import RowNumber
+(Product.objects
+ .order_by("category_id", "-created_at")
+ .annotate(rownum=Window(expression=RowNumber(), partition_by=["category"], order_by=F("created_at").desc())))
+```
+
+Unions / intersections
+```python
+A = Product.objects.filter(price__lt=100).values("id")
+B = Product.objects.filter(is_active=True).values("id")
+A.union(B)           # also .intersection(), .difference()
+```
+
+#### 11) Transactions patterns & locking options (recap)
+* Wrap multi-write operations with @transaction.atomic (in services.py).
+* Use select_for_update(of=("self",)) (Postgres) to lock only the selected table if your query joins others.
+* nowait=True to fail fast; skip_locked=True for worker-queue style processing.
+* Keep atomic blocks small and fast.
+
+#### 12) Pitfalls & fixes
+* N+1 queries: fix with select_related() and prefetch_related().
+* Counting large tables: qs.count() is SQL COUNT(*) (fast on indexed PK). Don’t len(list(qs)).
+* Slicing without order: always order_by before [offset:limit] for deterministic results.
+* values() then modifying: dicts don’t have save(). If you need to persist, fetch model instances.
+* bulk_* skip signals & auto_now: if you need these, update explicitly or post-process.
+* SQLite quirks: schema changes can be slower (temp tables). For prod, use Postgres.
+
+#### 13) A few ready-to-paste recipes
+Top tags per product (prefetch to avoid N+1):
+```python
+from django.db.models import Prefetch
+qs = (Product.objects
+      .active()
+      .prefetch_related(Prefetch("tags", queryset=Tag.objects.order_by("name")))
+      .only("id", "name", "slug"))
+for p in qs:
+    print(p.name, [t.name for t in p.tags.all()[:3]])
+```
+
+Atomic stock decrement example:
+```python
+from django.core.exceptions import ValidationError
+
+@transaction.atomic
+def reduce_price(slug: str, amount: Decimal):
+    p = Product.objects.select_for_update().get(slug=slug)
+    if p.price - amount < 0:
+        raise ValidationError("Price cannot go negative")
+    p.price = F("price") - amount
+    p.save(update_fields=["price", "updated_at"])
+```
+
+Search with pagination & total:
+```python
+q = "board"
+base = Product.objects.active().filter(name__icontains=q)
+total = base.count()
+page, per = 1, 20
+rows = (base
+        .select_related("category")
+        .prefetch_related("tags")
+        .order_by("-created_at")
+        [(page-1)*per : page*per])
+print(total, list(rows))
+```
+
+
+### TL;DR
+* Use select_related for FK/O2O; prefetch_related for M2M/reverse.
+* Favor F() + atomic blocks for concurrent-safe updates.
+* Use annotations (Count/Avg/Case/Subquery) to compute in the DB.
+* Keep views thin; put multi-step write logic into services.
+* Inspect SQL and EXPLAIN when optimizing; add the right indexes.
+
+
 ---
 
 ## 4) Admin Panel
